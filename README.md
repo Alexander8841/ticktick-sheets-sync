@@ -1,4 +1,4 @@
-# TickTick to Google Sheets Sync
+# Синхронизация TickTick с Google Таблицами
 
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![Google Sheets API](https://img.shields.io/badge/Google%20Sheets%20API-v4-34A853.svg)](https://developers.google.com/sheets/api)
@@ -6,94 +6,92 @@
 [![Windows Automation](https://img.shields.io/badge/Windows-Task%20Scheduler-0078D6.svg)](https://docs.microsoft.com/windows/win32/taskschd/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-Synchronizes completed lessons or billable tasks from the TickTick desktop app to Google Sheets for revenue calculation and attendance tracking.
-
-[English](#overview) | [Русский](#обзор-проекта)
+Утилита для автоматической синхронизации проведённых уроков и консультаций из десктопного приложения TickTick в Google Таблицу для учёта выручки и посещаемости.
 
 ---
 
-## Overview
+## Зачем это нужно
 
-If you track tutoring sessions or consulting calls in TickTick and maintain billing spreadsheets in Google Sheets, copying completed tasks manually is repetitive and easy to forget. Free cloud automation tools like IFTTT or Zapier often poll infrequently, drop recurring tasks, or run into monthly operation caps.
+Если отмечать уроки в TickTick, а финансовый учёт вести в таблицах, переносить каждую запись вручную долго и неудобно. Бесплатные облачные сервисы автоматизации (IFTTT, Zapier) в связке с TickTick работают с задержками до часа, пропускают повторяющиеся задачи и упираются в ежемесячные лимиты.
 
-This utility reads task history directly from the local TickTick desktop SQLite database (`TickTick.db`) in read-only mode, compares it against the Google Sheets log using persistent task IDs, and reconciles the differences:
+Скрипт решает эту задачу напрямую: он читает историю задач из локальной базы данных десктопного TickTick (`TickTick.db`) в режиме чтения, сравнивает её со списком в Google Таблице по постоянным идентификаторам (`Task ID`) и выполняет полную сверку:
 
-- **New sessions**: added with lesson date, student name, duration, and calculated fee.
-- **Unchecked tasks**: if a completed task is unchecked or deleted in TickTick, the corresponding row is removed from Google Sheets.
-- **Rescheduled sessions**: date and duration changes in TickTick update the existing row in place.
-- **Sorting**: the sheet is re-sorted chronologically after changes.
-- **Safe data handling**: manual entries and historical sessions from prior academic years are left intact.
+- **Новые занятия**: добавляются в журнал с датой, именем ученика, фактической длительностью и рассчитанной ставкой.
+- **Отмена занятий**: если задача в TickTick была снята с выполнения или удалена, соответствующая строка автоматически удаляется из таблицы.
+- **Переносы**: при изменении даты или времени урока в TickTick запись в таблице обновляется на месте.
+- **Хронология**: журнал автоматически сортируется по возрастанию даты после любых изменений.
+- **Безопасность истории**: строки, внесённые вручную, и занятия прошлых учебных лет защищены от удаления и перезаписи.
 
 ---
 
-## Architecture
+## Архитектура работы
 
 ```mermaid
 graph TD
-    subgraph TickTick Desktop
+    subgraph Приложение TickTick
         TT_DB[(TickTick.db SQLite)]
     end
 
-    subgraph Sync Engine
+    subgraph Скрипт синхронизации
         CFG[config.py] --> ENGINE[sync.py]
-        TT_DB -->|Read-only query| ENGINE
-        AUTH[Google OAuth / Token] --> GS_CLIENT[gspread]
+        TT_DB -->|Чтение базы данных| ENGINE
+        AUTH[Google OAuth / Токен] --> GS_CLIENT[gspread]
         GS_CLIENT --> ENGINE
     end
 
-    subgraph Google Sheets
-        LOG_SHEET[(Log Worksheet)]
-        REF_SHEET[(Reference Worksheet)]
-        DASH_SHEET[(Dashboard)]
+    subgraph Google Таблица
+        LOG_SHEET[(Лист «Лог»)]
+        REF_SHEET[(Лист «Справочник»)]
+        DASH_SHEET[(Лист «Дашборд»)]
     end
 
-    REF_SHEET -->|Rates and durations| ENGINE
-    LOG_SHEET -->|Existing task IDs| ENGINE
+    REF_SHEET -->|Ставки и длительность| ENGINE
+    LOG_SHEET -->|Текущие записи и Task ID| ENGINE
 
-    ENGINE -->|In-place updates| LOG_SHEET
-    ENGINE -->|Row deletions| LOG_SHEET
-    ENGINE -->|Append new rows| LOG_SHEET
-    ENGINE -->|Sort chronologically| LOG_SHEET
+    ENGINE -->|Обновление при переносах| LOG_SHEET
+    ENGINE -->|Удаление при отменах| LOG_SHEET
+    ENGINE -->|Добавление новых уроков| LOG_SHEET
+    ENGINE -->|Сортировка по дате| LOG_SHEET
 
     LOG_SHEET --> DASH_SHEET
-    DASH_SHEET --> REPORT[Console Summary]
+    DASH_SHEET --> REPORT[Консольный отчёт]
 ```
 
 ---
 
-## Repository Structure
+## Структура проекта
 
 ```
 ticktick-sheets-sync/
 ├── config/
-│   ├── config.yaml            # Local configuration with private paths and IDs (gitignored)
-│   └── config.example.yaml    # Template configuration file
+│   ├── config.yaml            # Локальная конфигурация с личными путями и ID (скрыта в .gitignore)
+│   └── config.example.yaml    # Публичный пример конфигурационного файла
 ├── src/
 │   ├── __init__.py
-│   ├── config.py              # Configuration loader
-│   └── sync.py                # Main reconciliation engine
+│   ├── config.py              # Загрузка и валидация настроек
+│   └── sync.py                # Движок сверки и работа с Google Sheets API
 ├── tests/
 │   ├── __init__.py
-│   └── test_suite.py          # Automated test suite
+│   └── test_suite.py          # Набор из 15 автоматических тестов
 ├── .gitignore
 ├── README.md
 ├── requirements.txt
-└── run_sync.bat               # Windows batch launcher
+└── run_sync.bat               # Скрипт запуска для Windows
 ```
 
 ---
 
-## Setup and Usage
+## Установка и настройка
 
-### 1. Requirements
+### 1. Требования
 
-- Python 3.10 or higher
-- TickTick desktop client for Windows or macOS
-- Google Cloud project with the Google Sheets API enabled and OAuth credentials configured
+- Python 3.10 или выше
+- Установленное приложение TickTick для Windows или macOS
+- Проект в Google Cloud с включённым Google Sheets API и настроенным OAuth-доступом
 
-### 2. Installation
+### 2. Установка
 
-Clone the repository and install dependencies:
+Клонируйте репозиторий и установите зависимости:
 
 ```bash
 git clone https://github.com/Alexander8841/ticktick-sheets-sync.git
@@ -101,27 +99,32 @@ cd ticktick-sheets-sync
 pip install -r requirements.txt
 ```
 
-### 3. Configuration
+### 3. Конфигурация
 
-Copy `config/config.example.yaml` to `config/config.yaml`:
+Скопируйте шаблон конфигурации в рабочий файл:
 
 ```bash
 cp config/config.example.yaml config/config.yaml
 ```
 
-Update the values in `config/config.yaml`:
+Заполните параметры в `config/config.yaml`:
 
 ```yaml
 ticktick:
-  db_path: "C:\\Users\\your_username\\AppData\\Roaming\\Tick_Tick\\TickTick.db"
-  project_id: "your_project_id_here"
+  # Путь к локальной базе данных TickTick
+  db_path: "C:\\Users\\ваше_имя\\AppData\\Roaming\\Tick_Tick\\TickTick.db"
+  # ID проекта (списка) в TickTick
+  project_id: "ваш_project_id"
+  # Дата начала учебного года (задачи до этой даты не затрагиваются)
   academic_year_start: "2026-09-01"
+  # Ключевые слова для игнорирования не тарифицируемых задач
   ignore_keywords:
     - "пробн"
     - "trial"
 
 google_sheets:
-  spreadsheet_id: "your_spreadsheet_id_here"
+  # ID таблицы из её URL
+  spreadsheet_id: "ваш_spreadsheet_id"
   worksheets:
     log: "Лог"
     dashboard: "Дашборд"
@@ -130,74 +133,55 @@ google_sheets:
 
 defaults:
   known_students:
-    - "Student 1"
-    - "Student 2"
+    - "Ученик 1"
+    - "Ученик 2"
   default_durations:
-    "Student 1": 1.5
-    "Student 2": 1.0
+    "Ученик 1": 1.5
+    "Ученик 2": 1.0
     "_default": 1.0
 ```
 
-### 4. Running the Sync
+### 4. Запуск синхронизации
 
-Run directly:
+Запуск вручную через Python:
 
 ```bash
 python src/sync.py
 ```
 
-On Windows, you can also run `run_sync.bat`.
+В Windows можно дважды кликнуть по файлу `run_sync.bat`.
 
 ---
 
-## Automated Scheduling on Windows
+## Автозапуск по расписанию в Windows
 
-To run the sync automatically every night at 22:00 via Windows Task Scheduler:
+Чтобы синхронизация выполнялась автоматически каждый вечер в 22:00 через Планировщик заданий Windows:
 
 ```cmd
-schtasks /create /tn "SyncTeachingTasks" /tr "\"C:\Users\<Username>\MyFiles\DS_Projects\ticktick-sheets-sync\run_sync.bat\" --no-pause" /sc daily /st 22:00 /f
+schtasks /create /tn "SyncTeachingTasks" /tr "\"C:\Users\<Имя_пользователя>\MyFiles\DS_Projects\ticktick-sheets-sync\run_sync.bat\" --no-pause" /sc daily /st 22:00 /f
 ```
 
 ---
 
-## Testing
+## Тестирование
 
-Run the test suite:
+Запуск полного набора автотестов:
 
 ```bash
 python tests/test_suite.py
 ```
 
-Tests cover:
-- Read-only querying of TickTick SQLite tables
-- Configuration parsing and path resolution
-- Google Sheets formula validation (checks for `#REF!`, `#VALUE!`, `#NAME?`)
-- Full reconciliation lifecycle on an isolated test sheet (additions, deletions, in-place updates, out-of-order sorting)
-- Rate-limiting retry handling
-- Preservation of manual entries and historical records
-- Batch file execution without syntax errors
+Тесты проверяют:
+- Чтение SQLite-базы TickTick в режиме `mode=ro` без блокировки десктопного приложения.
+- Корректность парсинга конфигурации и обработки ошибок при отсутствии файлов.
+- Целостность формул на листах Google Таблицы (проверка на отсутствие `#REF!`, `#VALUE!`, `#NAME?`).
+- Жизненный цикл сверки на изолированном тестовом листе (добавление, удаление при отмене, обновление при переносе, авторасширение границ сетки).
+- Повторные попытки с экспоненциальной задержкой при исчерпании лимитов запросов Google API (ошибка 429).
+- Защиту исторических строк и записей ручного ввода от удаления.
+- Запуск bat-скриптов без синтаксических ошибок.
 
 ---
 
-<a name="обзор-проекта"></a>
-## Обзор проекта (на русском)
+## Лицензия
 
-Скрипт синхронизирует проведённые уроки или оплачиваемые консультации из десктопного приложения TickTick в Google Таблицу для учёта выручки и посещаемости.
-
-### Зачем это нужно
-
-Если отмечать уроки в TickTick, а бухгалтерию вести в Google Таблицах, переносить каждую запись вручную неудобно. Бесплатные сервисы вроде IFTTT или Zapier в связке с TickTick работают нестабильно: опрашивают задачи с задержкой до часа, пропускают повторяющиеся события и ограничены лимитами запусков.
-
-Этот скрипт подключается напрямую к локальной базе данных десктопного TickTick (`TickTick.db`) в режиме чтения, сверяет выполненные задачи со списком в Google Таблице по уникальным `Task ID` и вносит изменения:
-
-- Добавляет новые проведённые занятия с датой, учеником, длительностью и суммой.
-- Удаляет запись из таблицы, если галочка с задачи в TickTick была снята или урок отменился.
-- Обновляет дату и время, если урок перенесли на другой день.
-- Сортирует журнал по хронологии.
-- Не трогает строки, добавленные вручную, и записи за прошлые учебные годы.
-
----
-
-## License
-
-MIT License. See `LICENSE` for details.
+Проект распространяется под лицензией MIT. Подробности в файле `LICENSE`.
