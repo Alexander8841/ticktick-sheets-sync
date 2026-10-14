@@ -27,10 +27,10 @@
    - **Atomic Appends**: New sessions are appended at the bottom with native date/time and duration cell formatting.
    - **Chronological Sorting**: Automatically re-sorts data rows ascending by timestamp after all mutations.
 
-3. **🛡️ Zero-Duplicate Guarantee & Manual Record Protection**  
+3. **🛡️ Zero-Duplicate Guarantee & Manual / Historical Record Protection**  
    - Every TickTick task is tracked via its immutable 24-character hexadecimal ID in Column H (`Task ID`).
    - Strict deduplication ensures identical task IDs cannot be duplicated.
-   - **Unconditional Manual Protection**: Historical rows and manually inserted records (rows without a Task ID, placeholders, or prefixed with `manual_`/`ручн_`) are strictly preserved and never mutated or deleted.
+   - **Unconditional Historical & Manual Protection**: Manual rows (without Task ID or prefixed with `manual_`/`ручн_`) as well as historical records dated prior to `academic_year_start` are strictly preserved and never mutated or deleted.
 
 4. **📊 Financial Dashboard & Formula Health Validation**  
    Directly interacts with Google Sheets to calculate monthly hours, completed lessons, and revenue against financial targets. Performs a comprehensive formula integrity scan (`#REF!`, `#VALUE!`, `#N/A`, `#DIV/0!`) across all worksheets on every run.
@@ -215,7 +215,7 @@ schtasks /create /tn "SyncTeachingTasks" /tr "\"C:\Users\<Username>\MyFiles\DS_P
   - Перенесенные уроки обновляются на месте (`[ПЕРЕНОС]`).
   - Новые уроки добавляются в конец с правильным форматированием дат и чисел.
   - Таблица автоматически сортируется в хронологическом порядке.
-- **Защита ручных записей**: Уроки, внесенные вручную (без Task ID или с префиксом `manual_`), защищены от удаления и перезаписи.
+- **Защита ручных и архивных записей**: Уроки, внесенные вручную (без Task ID или с префиксом `manual_`), а также исторические записи до начала учебного года защищены от удаления и перезаписи.
 - **Контроль формул и дашборда**: На каждом запуске проверяется целостность формул на всех листах книги (отсутствие ошибок `#REF!`, `#VALUE!`) и выводится сводка выручки за текущий месяц.
 - **Полная изоляция секретов**: Персональные пути, ID списков и ключи вынесены в `config/config.yaml` и надежно добавлены в `.gitignore`.
 

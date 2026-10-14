@@ -53,12 +53,9 @@ def find_config_path(explicit_path: Optional[Union[str, Path]] = None) -> Path:
         return default_config
 
     example_config = repo_root / "config" / "config.example.yaml"
-    if example_config.exists():
-        return example_config
-
     raise FileNotFoundError(
-        f"Configuration file not found. Looked in: {default_config} and {example_config}. "
-        "Please copy config/config.example.yaml to config/config.yaml and configure your settings."
+        f"Configuration file not found: '{default_config}'. "
+        f"Please copy '{example_config}' to '{default_config}' and configure your settings."
     )
 
 

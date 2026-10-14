@@ -16,6 +16,11 @@ set "EXIT_CODE=%ERRORLEVEL%"
 
 popd
 
+for %%A in (%*) do (
+    if /i "%%~A"=="--no-pause" exit /b %EXIT_CODE%
+    if /i "%%~A"=="--non-interactive" exit /b %EXIT_CODE%
+)
+
 if "%~1"=="--no-pause" exit /b %EXIT_CODE%
 if "%~1"=="--non-interactive" exit /b %EXIT_CODE%
 

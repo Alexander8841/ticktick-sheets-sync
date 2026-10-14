@@ -40,22 +40,14 @@ def get_shared_spreadsheet():
     global _cached_sh
     if _cached_sh is None:
         gc = sync_module.get_google_sheets_client(CONFIG.credentials_path)
-        for attempt in range(5):
-            try:
-                _cached_sh = gc.open_by_key(CONFIG.spreadsheet_id)
-                break
-            except Exception as e:
-                if "429" in str(e) and attempt < 4:
-                    print(f"    [WAIT] Quota reached, pausing 15s (attempt {attempt+1}/5)...")
-                    time.sleep(15)
-                else:
-                    raise
+        _cached_sh = sync_module.call_with_retry(lambda: gc.open_by_key(CONFIG.spreadsheet_id))
     return _cached_sh
 
 
 def test_sqlite():
     print("[1] Testing SQLite read-only connection and data...")
-    db_uri = f"file:{CONFIG.ticktick_db_path}?mode=ro"
+    posix_db = Path(CONFIG.ticktick_db_path).resolve().as_posix()
+    db_uri = f"file:{posix_db}?mode=ro"
     conn = sqlite3.connect(db_uri, uri=True)
     cur = conn.cursor()
     cur.execute(
@@ -84,13 +76,19 @@ def test_config_loader():
     assert cfg.default_durations.get("Лиза") == 1.5
     assert cfg.default_durations.get("Лиза 2") == 1.0
 
+    # Test loading config.example.yaml
+    example_path = REPO_ROOT / "config" / "config.example.yaml"
+    cfg_example = load_config(example_path)
+    assert cfg_example.academic_year_start == "2026-09-01"
+    assert "Student 1" in cfg_example.known_students
+
     # Test error handling when pointing to non-existent config
     try:
         load_config("non_existent_config.yaml")
         assert False, "Should have raised FileNotFoundError for missing config"
     except FileNotFoundError:
         pass
-    print("    [PASS] Config loader correctly parsed config and handled edge cases")
+    print("    [PASS] Config loader correctly parsed configs and handled edge cases")
 
 
 def test_files_exist():
@@ -118,7 +116,7 @@ def test_task_scheduler():
     )
     assert res.returncode == 0, f"Task Scheduler query failed: {res.stderr}"
     out_lower = res.stdout.lower()
-    assert "ticktick-sheets-sync" in out_lower or "run_sync.bat" in out_lower or "syncteachingtasks" in out_lower, (
+    assert "ticktick-sheets-sync" in out_lower and "run_sync.bat" in out_lower, (
         f"Task Scheduler job did not match expected path: {res.stdout}"
     )
     print("    [PASS] Task Scheduler job exists and configured")
@@ -129,8 +127,9 @@ def test_google_sheets_and_formulas():
     sh = get_shared_spreadsheet()
 
     total_errors = []
-    for s in sh.worksheets():
-        vals = s.get_all_values()
+    worksheets = sync_module.call_with_retry(lambda: sh.worksheets())
+    for s in worksheets:
+        vals = sync_module.call_with_retry(lambda: s.get_all_values())
         for r_idx, row in enumerate(vals):
             for c_idx, val in enumerate(row):
                 v_str = str(val).strip()
@@ -163,8 +162,8 @@ def test_semen_duration_consistency():
         assert computed_dur == 1.0, f"Expected 1.0 hr, got {computed_dur}"
 
     sh = get_shared_spreadsheet()
-    ws_log = sh.worksheet("Лог")
-    log_vals = ws_log.get_all_values()
+    ws_log = sync_module.call_with_retry(lambda: sh.worksheet("Лог"))
+    log_vals = sync_module.call_with_retry(lambda: ws_log.get_all_values())
     semen_row = None
     for r in log_vals:
         if len(r) > 7 and r[7] == "6ac51c78fd764a6845fab4a1":
@@ -194,8 +193,8 @@ def test_sync_google_sheets_idempotency():
 def test_chronological_ordering():
     print("[8] Testing chronological ordering of Google Sheets 'Лог'...")
     sh = get_shared_spreadsheet()
-    ws_log = sh.worksheet("Лог")
-    rows = ws_log.get_all_values()
+    ws_log = sync_module.call_with_retry(lambda: sh.worksheet("Лог"))
+    rows = sync_module.call_with_retry(lambda: ws_log.get_all_values())
 
     dates = []
     for r in rows[1:]:
@@ -218,10 +217,9 @@ def test_bat_files_execution():
             content = f.read()
         assert b"\r\n" in content, f"{name} does not have CRLF line endings"
 
-        # Run batch file with empty input (\n) to satisfy pause
+        # Verify execution with --no-pause and custom arguments without hanging
         res = subprocess.run(
-            ["cmd.exe", "/c", str(bat_path)],
-            input="\n",
+            ["cmd.exe", "/c", str(bat_path), "--config", "config/config.yaml", "--no-pause"],
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -231,6 +229,7 @@ def test_bat_files_execution():
         assert res.returncode == 0, f"{name} failed with exit code {res.returncode}: {res.stderr}"
         assert "'e' is not recognized" not in res.stdout, f"{name} emitted command syntax error!"
         assert "не является внутренней или внешней" not in res.stdout, f"{name} emitted command error!"
+        assert "Press any key to continue" not in res.stdout, f"{name} hung on pause despite --no-pause!"
         stray_file = bat_path.parent / "Google"
         assert not stray_file.exists(), f"{name} created stray 'Google' file!"
         print(f"    [PASS] {name} executed cleanly with code 0")
@@ -332,26 +331,28 @@ def test_reconciliation_isolated_sheet():
     temp_title = "_test_reconcile_temp"
 
     # Cleanup leftovers
-    for ws in sh.worksheets():
+    for ws in sync_module.call_with_retry(lambda: sh.worksheets()):
         if ws.title == temp_title:
             try:
-                sh.del_worksheet(ws)
+                sync_module.call_with_retry(lambda: sh.del_worksheet(ws))
             except Exception:
                 pass
             break
 
-    # Start with tight grid limits (exactly 6 rows)
-    ws_test = sh.add_worksheet(title=temp_title, rows=6, cols=8)
+    # Start with tight grid limits (exactly 7 rows)
+    ws_test = sync_module.call_with_retry(lambda: sh.add_worksheet(title=temp_title, rows=7, cols=8))
     try:
         initial_data = [
             ["Дата и время", "Ученик", "Длительность (ч)", "Ставка (₽/ч)", "Сумма (₽)", "Дата (норм.)", "Ученик (норм.)", "Task ID"],
+            # Historical task from previous academic year (August 2026) with valid Task ID - must NOT be deleted
+            [sync_module.datetime_to_serial(datetime(2026, 8, 20, 12, 0)), "Марина", 1.0, "", "", "", "", "tid_past_year_august"],
             [sync_module.datetime_to_serial(datetime(2026, 9, 1, 10, 0)), "Лиза", 1.5, "", "", "", "", ""],
             [sync_module.datetime_to_serial(datetime(2026, 9, 2, 12, 0)), "Марина", 1.0, "", "", "", "", "manual_test_sept_1"],
             [sync_module.datetime_to_serial(datetime(2026, 9, 5, 16, 0)), "Тимофей", 1.5, "", "", "", "", "tid_keep_001"],
             [sync_module.datetime_to_serial(datetime(2026, 9, 8, 16, 0)), "Лиза 2", 1.0, "", "", "", "", "tid_resched_002"],
             [sync_module.datetime_to_serial(datetime(2026, 9, 10, 18, 0)), "Семен", 1.5, "", "", "", "", "tid_uncheck_003"],
         ]
-        ws_test.update(range_name="A1:H6", values=initial_data)
+        sync_module.call_with_retry(lambda: ws_test.update(range_name="A1:H7", values=initial_data))
 
         active_tasks = [
             {"id": "tid_keep_001", "raw_title": "Тимофей", "student": "Тимофей", "datetime": datetime(2026, 9, 5, 16, 0), "duration": 1.5},
@@ -361,7 +362,7 @@ def test_reconciliation_isolated_sheet():
 
         res = sync_module.sync_google_sheets(active_tasks, sh=sh, worksheet_name=temp_title, config=CONFIG)
 
-        # 1. Uncheck / Cancellation
+        # 1. Uncheck / Cancellation: only active academic year unchecked tasks are deleted
         assert len(res.cancelled) == 1
         assert res.cancelled[0]["id"] == "tid_uncheck_003"
         assert res.cancelled[0]["student"] == "Семен"
@@ -376,23 +377,26 @@ def test_reconciliation_isolated_sheet():
         assert res.new_tasks[0]["id"] == "tid_new_004"
 
         # 4. Final sheet checks
-        final_rows = ws_test.get_all_values()
+        final_rows = sync_module.call_with_retry(lambda: ws_test.get_all_values())
         all_ids = [r[7] for r in final_rows[1:] if len(r) >= 8]
         assert "tid_uncheck_003" not in all_ids
+
+        # Historical task from August is preserved despite not being in active_tasks
+        assert "tid_past_year_august" in all_ids
 
         # Manual rows preserved
         assert any(r[1] == "Лиза" and (len(r) < 8 or not r[7].strip()) for r in final_rows[1:])
         assert any(r[1] == "Марина" and len(r) >= 8 and r[7].strip() == "manual_test_sept_1" for r in final_rows[1:])
 
         # Out-of-order sorting: Liza 2 (03.09) must come before Timofey (05.09)
-        assert len(final_rows) == 6
-        assert final_rows[3][7] == "tid_resched_002"
-        assert final_rows[4][7] == "tid_keep_001"
+        assert len(final_rows) == 7
+        assert final_rows[4][7] == "tid_resched_002"
+        assert final_rows[5][7] == "tid_keep_001"
 
-        print("    [PASS] Full reconciliation lifecycle passed on isolated worksheet")
+        print("    [PASS] Full reconciliation lifecycle passed on isolated worksheet (including historical rows protection)")
     finally:
         try:
-            sh.del_worksheet(ws_test)
+            sync_module.call_with_retry(lambda: sh.del_worksheet(ws_test))
         except Exception:
             pass
 
@@ -402,33 +406,33 @@ def test_deduplication_safeguard():
     sh = get_shared_spreadsheet()
     temp_title = "_test_dedup_temp"
 
-    for ws in sh.worksheets():
+    for ws in sync_module.call_with_retry(lambda: sh.worksheets()):
         if ws.title == temp_title:
             try:
-                sh.del_worksheet(ws)
+                sync_module.call_with_retry(lambda: sh.del_worksheet(ws))
             except Exception:
                 pass
             break
 
-    ws_test = sh.add_worksheet(title=temp_title, rows=5, cols=8)
+    ws_test = sync_module.call_with_retry(lambda: sh.add_worksheet(title=temp_title, rows=5, cols=8))
     try:
         initial_data = [
             ["Дата и время", "Ученик", "Длительность (ч)", "Ставка (₽/ч)", "Сумма (₽)", "Дата (норм.)", "Ученик (норм.)", "Task ID"],
             [sync_module.datetime_to_serial(datetime(2026, 9, 1, 10, 0)), "Лиза", 1.5, "", "", "", "", "tid_dup_001"],
             [sync_module.datetime_to_serial(datetime(2026, 9, 1, 10, 0)), "Лиза", 1.5, "", "", "", "", "tid_dup_001"],
         ]
-        ws_test.update(range_name="A1:H3", values=initial_data)
+        sync_module.call_with_retry(lambda: ws_test.update(range_name="A1:H3", values=initial_data))
         active_tasks = [
             {"id": "tid_dup_001", "raw_title": "Лиза", "student": "Лиза", "datetime": datetime(2026, 9, 1, 10, 0), "duration": 1.5}
         ]
         res = sync_module.sync_google_sheets(active_tasks, sh=sh, worksheet_name=temp_title, config=CONFIG)
         assert len(res.cancelled) == 1
-        final_rows = ws_test.get_all_values()
+        final_rows = sync_module.call_with_retry(lambda: ws_test.get_all_values())
         assert len(final_rows) == 2
         print("    [PASS] Duplicate Task IDs are automatically pruned")
     finally:
         try:
-            sh.del_worksheet(ws_test)
+            sync_module.call_with_retry(lambda: sh.del_worksheet(ws_test))
         except Exception:
             pass
 

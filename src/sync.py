@@ -18,15 +18,33 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar, Union
 T = TypeVar("T")
 
 
-def call_with_retry(func: Callable[[], T], max_retries: int = 5, base_delay: float = 6.0) -> T:
-    """Executes a function with automatic retry and backoff when encountering 429 Quota Exceeded."""
+def is_quota_or_rate_limit_error(e: Exception) -> bool:
+    """Detects 429 / RESOURCE_EXHAUSTED / Rate Limit / Quota Exceeded errors."""
+    msg = str(e).lower()
+    if "429" in msg or "quota" in msg or "resource_exhausted" in msg or "rate limit" in msg:
+        return True
+    if hasattr(e, "response") and getattr(e.response, "status_code", None) == 429:
+        return True
+    return False
+
+
+def call_with_retry(
+    func: Callable[[], T],
+    max_retries: int = 5,
+    base_delay: float = 8.0,
+    backoff_factor: float = 1.5,
+) -> T:
+    """Executes a function with automatic retry and exponential backoff when encountering rate limits or quota errors."""
     for attempt in range(max_retries):
         try:
             return func()
         except Exception as e:
-            if "429" in str(e) and attempt < max_retries - 1:
-                delay = base_delay * (attempt + 1)
-                print(f"⏳ Превышен лимит запросов Google Sheets (429). Ожидание {delay:.0f}с (попытка {attempt + 1}/{max_retries})...")
+            if is_quota_or_rate_limit_error(e) and attempt < max_retries - 1:
+                delay = base_delay * (backoff_factor ** attempt)
+                print(
+                    f"⏳ Превышен лимит запросов Google Sheets API (429/Quota). Ожидание {delay:.1f}с "
+                    f"(попытка {attempt + 1}/{max_retries})..."
+                )
                 time.sleep(delay)
             else:
                 raise
@@ -288,8 +306,9 @@ def get_ticktick_tasks(
     if not os.path.exists(db_path):
         raise FileNotFoundError(f"Файл базы данных TickTick не найден: {db_path}")
 
-    # Read-only URI connection
-    db_uri = f"file:{db_path}?mode=ro"
+    # Read-only URI connection with forward slashes
+    posix_db_path = Path(db_path).resolve().as_posix()
+    db_uri = f"file:{posix_db_path}?mode=ro"
     conn = sqlite3.connect(db_uri, uri=True)
     cur = conn.cursor()
 
@@ -445,6 +464,7 @@ def sync_google_sheets(
         call_with_retry(lambda: sh.batch_update({"requests": header_updates}))
 
     current_tasks_map = {t["id"]: t for t in tasks}
+    cutoff_dt = parse_sheet_datetime(cfg.academic_year_start) if cfg.academic_year_start else None
 
     to_delete = []
     to_update = []
@@ -454,6 +474,14 @@ def sync_google_sheets(
     for idx, row in enumerate(all_values[1:], start=2):
         if is_manual_row(row):
             # Strict protection: skip manual/historical records
+            continue
+
+        sheet_dt = parse_sheet_datetime(row[0]) if len(row) > 0 else None
+
+        # Historical record protection: rows from before academic_year_start must NOT be deleted
+        if cutoff_dt and sheet_dt and sheet_dt < cutoff_dt:
+            if len(row) > 7 and row[7].strip():
+                existing_ids.add(row[7].strip())
             continue
 
         tid = row[7].strip()
