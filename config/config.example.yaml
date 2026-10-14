@@ -1,0 +1,54 @@
+# ==============================================================================
+# TickTick to Google Sheets Sync - Configuration Template
+# ==============================================================================
+# Instructions:
+# 1. Copy this file to 'config/config.yaml':
+#      cp config/config.example.yaml config/config.yaml
+# 2. Fill in your personal paths, IDs, and student lists below.
+# 3. 'config/config.yaml' is already ignored by .gitignore to protect your privacy.
+
+ticktick:
+  # Absolute path to your local TickTick SQLite database
+  # - Windows: C:\Users\<Username>\AppData\Roaming\Tick_Tick\TickTick.db
+  # - macOS: ~/Library/Application Support/TickTick/TickTick.db
+  db_path: "C:\\Users\\your_username\\AppData\\Roaming\\Tick_Tick\\TickTick.db"
+  
+  # TickTick Project / List ID (e.g. 24-char hex string)
+  # Tip: Can be found in the web app URL or queried from ProjectModel table
+  project_id: "your_project_id_here"
+  
+  # Filter tasks starting/completed on or after this date (YYYY-MM-DD)
+  academic_year_start: "2026-09-01"
+  
+  # Case-insensitive keywords to exclude tasks (e.g. unpaid trial lessons)
+  ignore_keywords:
+    - "пробн"
+    - "trial"
+
+google_sheets:
+  # Google Spreadsheet ID (from spreadsheet URL: /spreadsheets/d/<ID>/edit)
+  spreadsheet_id: "your_google_spreadsheet_id_here"
+  
+  # Worksheet names inside the spreadsheet
+  worksheets:
+    log: "Лог"
+    dashboard: "Дашборд"
+    reference: "Справочник"
+    
+  # Optional path to Google OAuth credentials JSON or Service Account key.
+  # If null or omitted, searches default locations:
+  # - %APPDATA%/gspread/authorized_user.json (Windows)
+  # - ~/.config/gspread/authorized_user.json (Linux/macOS)
+  credentials_path: null
+
+defaults:
+  # Fallback student list if 'Справочник' worksheet is not found or empty
+  known_students:
+    - "Student 1"
+    - "Student 2"
+    
+  # Fallback default lesson durations in hours
+  default_durations:
+    "Student 1": 1.5
+    "Student 2": 1.0
+    "_default": 1.0
