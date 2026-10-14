@@ -10,9 +10,27 @@ import os
 import re
 import sqlite3
 import sys
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar, Union
+
+T = TypeVar("T")
+
+
+def call_with_retry(func: Callable[[], T], max_retries: int = 5, base_delay: float = 6.0) -> T:
+    """Executes a function with automatic retry and backoff when encountering 429 Quota Exceeded."""
+    for attempt in range(max_retries):
+        try:
+            return func()
+        except Exception as e:
+            if "429" in str(e) and attempt < max_retries - 1:
+                delay = base_delay * (attempt + 1)
+                print(f"⏳ Превышен лимит запросов Google Sheets (429). Ожидание {delay:.0f}с (попытка {attempt + 1}/{max_retries})...")
+                time.sleep(delay)
+            else:
+                raise
+
 
 # Set UTF-8 encoding for standard output and error in Windows terminal
 if sys.stdout and hasattr(sys.stdout, "reconfigure"):
@@ -218,9 +236,9 @@ def get_known_students(
     try:
         if not sh:
             gc = get_google_sheets_client(cfg.credentials_path)
-            sh = gc.open_by_key(cfg.spreadsheet_id)
-        ws_ref = sh.worksheet(cfg.reference_worksheet)
-        vals = ws_ref.get_all_values()
+            sh = call_with_retry(lambda: gc.open_by_key(cfg.spreadsheet_id))
+        ws_ref = call_with_retry(lambda: sh.worksheet(cfg.reference_worksheet))
+        vals = call_with_retry(lambda: ws_ref.get_all_values())
         names = []
         durations = {}
         for r in vals[1:]:
@@ -355,10 +373,10 @@ def sync_google_sheets(
 
     if not sh:
         gc = get_google_sheets_client(cfg.credentials_path)
-        sh = gc.open_by_key(cfg.spreadsheet_id)
-    ws_log = sh.worksheet(worksheet_name)
+        sh = call_with_retry(lambda: gc.open_by_key(cfg.spreadsheet_id))
+    ws_log = call_with_retry(lambda: sh.worksheet(worksheet_name))
 
-    meta = sh.fetch_sheet_metadata()
+    meta = call_with_retry(lambda: sh.fetch_sheet_metadata())
     log_sheet = [s for s in meta["sheets"] if s["properties"]["title"] == worksheet_name][0]
     sheet_id = log_sheet["properties"]["sheetId"]
     grid_props = log_sheet["properties"].get("gridProperties", {})
@@ -368,7 +386,7 @@ def sync_google_sheets(
     # Ensure at least 8 columns exist for Task ID
     if current_grid_cols < 8:
         needed_cols = 8 - current_grid_cols
-        sh.batch_update(
+        call_with_retry(lambda: sh.batch_update(
             {
                 "requests": [
                     {
@@ -380,10 +398,10 @@ def sync_google_sheets(
                     }
                 ]
             }
-        )
+        ))
         current_grid_cols += needed_cols
 
-    all_values = ws_log.get_all_values()
+    all_values = call_with_retry(lambda: ws_log.get_all_values())
     if not all_values:
         raise ValueError(f"Лист '{worksheet_name}' пуст!")
 
@@ -392,11 +410,11 @@ def sync_google_sheets(
 
     # Ensure C1 is plain header 'Длительность (ч)'
     if len(header) > 2 and header[2] != "Длительность (ч)":
-        ws_log.update_acell("C1", "Длительность (ч)")
+        call_with_retry(lambda: ws_log.update_acell("C1", "Длительность (ч)"))
 
     # Ensure H1 is 'Task ID'
     if len(header) < 8 or header[7] != "Task ID":
-        ws_log.update_acell("H1", "Task ID")
+        call_with_retry(lambda: ws_log.update_acell("H1", "Task ID"))
         header_updates.append(
             {
                 "repeatCell": {
@@ -424,7 +442,7 @@ def sync_google_sheets(
             }
         )
     if header_updates:
-        sh.batch_update({"requests": header_updates})
+        call_with_retry(lambda: sh.batch_update({"requests": header_updates}))
 
     current_tasks_map = {t["id"]: t for t in tasks}
 
@@ -531,7 +549,7 @@ def sync_google_sheets(
             )
             new_date_str = t["datetime"].strftime("%d.%m.%Y %H:%M")
             print(f"[ПЕРЕНОС] Обновлено занятие: {t['student']}, новая дата: {new_date_str}")
-        ws_log.batch_update(update_data, value_input_option="USER_ENTERED")
+        call_with_retry(lambda: ws_log.batch_update(update_data, value_input_option="USER_ENTERED"))
 
     # 2. Apply deletions in descending order of row index
     if to_delete:
@@ -549,7 +567,7 @@ def sync_google_sheets(
             }
             for item in sorted_deletions
         ]
-        sh.batch_update({"requests": delete_requests})
+        call_with_retry(lambda: sh.batch_update({"requests": delete_requests}))
         current_grid_rows -= len(to_delete)
         for item in to_delete:
             print(f"[ОТМЕНА] Удалено занятие: {item['student']} за {item['date']}")
@@ -565,7 +583,7 @@ def sync_google_sheets(
         # Grid limit protection: ensure worksheet has enough rows to hold new tasks
         if end_row > current_grid_rows:
             needed_rows = end_row - current_grid_rows
-            sh.batch_update(
+            call_with_retry(lambda: sh.batch_update(
                 {
                     "requests": [
                         {
@@ -577,7 +595,7 @@ def sync_google_sheets(
                         }
                     ]
                 }
-            )
+            ))
             current_grid_rows += needed_rows
 
         rows_abc = []
@@ -587,8 +605,8 @@ def sync_google_sheets(
             rows_abc.append([serial_dt, t["student"], t["duration"]])
             rows_h.append([t["id"]])
 
-        ws_log.update(range_name=f"A{start_row}:C{end_row}", values=rows_abc)
-        ws_log.update(range_name=f"H{start_row}:H{end_row}", values=rows_h)
+        call_with_retry(lambda: ws_log.update(range_name=f"A{start_row}:C{end_row}", values=rows_abc))
+        call_with_retry(lambda: ws_log.update(range_name=f"H{start_row}:H{end_row}", values=rows_h))
         added_count = len(new_tasks)
 
     final_total_rows = rows_after_deletions + len(new_tasks)
@@ -682,7 +700,7 @@ def sync_google_sheets(
             )
 
         if batch_requests:
-            sh.batch_update({"requests": batch_requests})
+            call_with_retry(lambda: sh.batch_update({"requests": batch_requests}))
 
     return SyncResult(added_count, new_tasks, sh, cancelled=to_delete, updated=to_update)
 
@@ -695,9 +713,9 @@ def get_current_stats(
     cfg = config or get_config()
     if not sh:
         gc = get_google_sheets_client(cfg.credentials_path)
-        sh = gc.open_by_key(cfg.spreadsheet_id)
+        sh = call_with_retry(lambda: gc.open_by_key(cfg.spreadsheet_id))
 
-    ws_dash = sh.worksheet(cfg.dashboard_worksheet)
+    ws_dash = call_with_retry(lambda: sh.worksheet(cfg.dashboard_worksheet))
 
     # Dashboard values
     month_name_map = {
@@ -716,7 +734,7 @@ def get_current_stats(
     }
 
     # Batch fetch summary block B3:H7 in a single API call
-    summary_grid = ws_dash.get_values("B3:H7")
+    summary_grid = call_with_retry(lambda: ws_dash.get_values("B3:H7"))
 
     def safe_cell(grid, r_idx, c_idx, default=""):
         if r_idx < len(grid) and c_idx < len(grid[r_idx]):
@@ -732,7 +750,7 @@ def get_current_stats(
     diff_val = safe_cell(summary_grid, 4, 2)  # D7
 
     # Student breakdown from Dashboard table (rows 11..35)
-    dash_table = ws_dash.get_values("B11:K35")
+    dash_table = call_with_retry(lambda: ws_dash.get_values("B11:K35"))
     student_stats = []
     for r in dash_table:
         if not r or not r[0] or r[0].upper() == "ИТОГО":
@@ -752,8 +770,9 @@ def get_current_stats(
 
     # Check formula errors across all worksheets
     errors = []
-    for s in sh.worksheets():
-        vals = s.get_all_values()
+    all_worksheets = call_with_retry(lambda: sh.worksheets())
+    for s in all_worksheets:
+        vals = call_with_retry(lambda: s.get_all_values())
         for r_idx, row in enumerate(vals):
             for c_idx, val in enumerate(row):
                 v_str = str(val).strip()
@@ -848,7 +867,7 @@ def main():
 
         # 1. Load Google Sheets client
         gc = get_google_sheets_client(cfg.credentials_path)
-        sh = gc.open_by_key(cfg.spreadsheet_id)
+        sh = call_with_retry(lambda: gc.open_by_key(cfg.spreadsheet_id))
         known_students, default_durations = get_known_students(sh, cfg)
 
         # 2. Fetch TickTick tasks
