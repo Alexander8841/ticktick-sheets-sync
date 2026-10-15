@@ -13,11 +13,11 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-# Ensure UTF-8 output
+# Ensure UTF-8 output and real-time line buffering
 if sys.stdout and hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
 if sys.stderr and hasattr(sys.stderr, "reconfigure"):
-    sys.stderr.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8", line_buffering=True)
 
 # Add repo root to sys.path
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -443,6 +443,7 @@ def test_logging_system():
     test_log = REPO_ROOT / "logs" / "_test_temp.log"
     try:
         logger, path = sync_module.setup_logging(test_log)
+        assert logger.propagate is False, "LOGGER.propagate must be False to prevent stderr leakage"
         logger.info("TEST_LOG_ENTRY_12345")
         assert path.exists(), f"Log file was not created: {path}"
         with open(path, "r", encoding="utf-8") as f:
@@ -480,18 +481,21 @@ def test_log_formula_self_healing():
                 pass
             break
 
-    ws_test = sync_module.call_with_retry(lambda: sh.add_worksheet(title=temp_title, rows=5, cols=8))
+    ws_test = sync_module.call_with_retry(lambda: sh.add_worksheet(title=temp_title, rows=6, cols=8))
     try:
-        # Corrupted header and stray space in column F
+        # Corrupted header, stray space in F2, and stray value in F5 (beyond total_rows=2)
         corrupted_data = [
             ["Дата и время", "Ученик", "Длительность (ч)", "BROKEN_RATE", "BROKEN_SUM", "#REF!", "BROKEN_ST", "Task ID"],
             [sync_module.datetime_to_serial(datetime(2026, 9, 1, 10, 0)), "Лиза", 1.5, "", "", "  ", "", "tid_heal_001"],
         ]
         sync_module.call_with_retry(lambda: ws_test.update(range_name="A1:H2", values=corrupted_data))
+        # Add a stray entry at F5 (far beyond the 2 data rows)
+        sync_module.call_with_retry(lambda: ws_test.update_acell("F5", "stray_far_below"))
 
         repaired, cleared = sync_module.ensure_log_integrity(ws_test, sh, ws_test.id, 2)
         assert len(repaired) == 4, f"Expected 4 repaired headers, got {repaired}"
         assert "F2" in cleared, f"Expected F2 to be cleared, got {cleared}"
+        assert "F5" in cleared, f"Expected F5 to be cleared beyond total_rows, got {cleared}"
 
         hdr_forms = sync_module.call_with_retry(lambda: ws_test.get("D1:G1", value_render_option="FORMULA"))
         assert all(str(f[0]).startswith("={") for f in hdr_forms if f)
@@ -499,7 +503,10 @@ def test_log_formula_self_healing():
         f2_val = sync_module.call_with_retry(lambda: ws_test.acell("F2", value_render_option="FORMULA")).value
         assert f2_val in ("", None), f"F2 still has value: {f2_val}"
 
-        print("    [PASS] Log formula self-healing clears collisions and restores canonical formulas")
+        f5_val = sync_module.call_with_retry(lambda: ws_test.acell("F5", value_render_option="FORMULA")).value
+        assert f5_val in ("", None), f"F5 still has value: {f5_val}"
+
+        print("    [PASS] Log formula self-healing clears collisions across entire column range and restores canonical formulas")
     finally:
         try:
             sync_module.call_with_retry(lambda: sh.del_worksheet(ws_test))

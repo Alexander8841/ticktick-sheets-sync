@@ -64,6 +64,7 @@ def setup_logging(
         file_handler.setLevel(level)
         LOGGER.addHandler(file_handler)
 
+    LOGGER.propagate = False
     _logging_configured = True
     return LOGGER, target_path
 
@@ -443,7 +444,7 @@ def ensure_log_integrity(
     ws_log: gspread.Worksheet,
     sh: gspread.Spreadsheet,
     sheet_id: int,
-    total_rows: int
+    total_rows: Optional[int] = None
 ) -> Tuple[List[str], List[str]]:
     """
     Ensures the integrity of array formulas in 'Лог' columns D, E, F, G:
@@ -456,9 +457,9 @@ def ensure_log_integrity(
     repaired_headers: List[str] = []
     cleared_cells: List[str] = []
 
-    # 1. Check for stray hardcoded entries in D2:G
+    # 1. Check for stray hardcoded entries in D2:G across the entire column range
     grid = call_with_retry(
-        lambda: ws_log.get(f"D2:G{max(total_rows, 2)}", value_render_option="FORMULA")
+        lambda: ws_log.get("D2:G", value_render_option="FORMULA")
     )
     col_names = ["D", "E", "F", "G"]
     stray_ranges = []
@@ -470,7 +471,7 @@ def ensure_log_integrity(
     if stray_ranges:
         call_with_retry(lambda: ws_log.batch_clear(stray_ranges))
         cleared_cells = stray_ranges
-        LOGGER.warning(f"Очищены блокирующие ячейки в столбцах формул листа 'Лог': {stray_ranges}")
+        LOGGER.warning(f"Очищены блокирующие ячейки в столбцах формул листа '{ws_log.title}': {stray_ranges}")
 
     # 2. Check header cells D1..G1 formulas and formatted values
     header_formulas = call_with_retry(
@@ -503,7 +504,7 @@ def ensure_log_integrity(
 
     if updates:
         call_with_retry(lambda: ws_log.batch_update(updates, value_input_option="USER_ENTERED"))
-        LOGGER.info(f"Восстановлены формулы в заголовках листа 'Лог': {repaired_headers}")
+        LOGGER.info(f"Восстановлены формулы в заголовках листа '{ws_log.title}': {repaired_headers}")
 
     return repaired_headers, cleared_cells
 
@@ -1147,7 +1148,7 @@ def print_report(
         for err in stats["errors"][:5]:
             print(f"      • {err}")
 
-    if log_path:
+    if log_path and not os.environ.get("TICKTICK_RUN_FROM_BAT"):
         print(f"\n 📄 Подробный журнал работы: {log_path}")
     print("═" * 68 + "\n")
 
@@ -1208,6 +1209,8 @@ def main():
         print(f"\n❌ Критическая ошибка при синхронизации: {e}", file=sys.stderr)
         import traceback
         traceback.print_exc()
+        if log_file and not os.environ.get("TICKTICK_RUN_FROM_BAT"):
+            print(f"\n📄 Подробный журнал ошибки сохранен в: {log_file}", file=sys.stderr)
         sys.exit(1)
 
 

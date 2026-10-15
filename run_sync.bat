@@ -5,6 +5,8 @@ title Синхронизация занятий (TickTick в Google Sheets)
 set "SCRIPT_DIR=%~dp0"
 pushd "%SCRIPT_DIR%"
 
+set "TICKTICK_RUN_FROM_BAT=1"
+
 if exist "C:\Users\alexander\.conda\envs\ml_base\python.exe" (
     set "PYTHON_EXE=C:\Users\alexander\.conda\envs\ml_base\python.exe"
 ) else (
