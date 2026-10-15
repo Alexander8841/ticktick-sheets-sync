@@ -14,6 +14,9 @@ if exist "C:\Users\alexander\.conda\envs\ml_base\python.exe" (
 "%PYTHON_EXE%" "%SCRIPT_DIR%src\sync.py" %*
 set "EXIT_CODE=%ERRORLEVEL%"
 
+echo.
+echo 📄 Подробный журнал работы: "%SCRIPT_DIR%logs\sync.log"
+
 popd
 
 for %%A in (%*) do (

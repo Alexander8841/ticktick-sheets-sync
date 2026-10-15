@@ -24,6 +24,7 @@ class AppConfig:
     credentials_path: Optional[str] = None
     known_students: List[str] = field(default_factory=list)
     default_durations: Dict[str, float] = field(default_factory=dict)
+    log_path: str = ""
     raw_config: dict = field(default_factory=dict)
     config_file_path: Optional[Path] = None
 
@@ -89,6 +90,17 @@ def load_config(config_path: Optional[Union[str, Path]] = None, reload: bool = F
         except (ValueError, TypeError):
             pass
 
+    # Logging configuration
+    repo_root = Path(__file__).resolve().parent.parent
+    log_data = data.get("logging", {})
+    raw_log_path = log_data.get("path") if isinstance(log_data, dict) else None
+    if raw_log_path:
+        expanded_log_path = os.path.expandvars(raw_log_path)
+        p = Path(expanded_log_path)
+        resolved_log_path = str((repo_root / p).resolve() if not p.is_absolute() else p.resolve())
+    else:
+        resolved_log_path = str((repo_root / "logs" / "sync.log").resolve())
+
     config = AppConfig(
         ticktick_db_path=expanded_db_path,
         project_id=str(tt_data.get("project_id", "")).strip(),
@@ -101,6 +113,7 @@ def load_config(config_path: Optional[Union[str, Path]] = None, reload: bool = F
         credentials_path=expanded_creds_path,
         known_students=[str(s).strip() for s in def_data.get("known_students", [])],
         default_durations=durations,
+        log_path=resolved_log_path,
         raw_config=data,
         config_file_path=file_path
     )

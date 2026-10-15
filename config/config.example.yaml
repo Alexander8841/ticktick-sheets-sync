@@ -52,3 +52,7 @@ defaults:
     "Student 1": 1.5
     "Student 2": 1.0
     "_default": 1.0
+
+logging:
+  # Path to execution log file (defaults to logs/sync.log relative to project root)
+  path: "logs/sync.log"

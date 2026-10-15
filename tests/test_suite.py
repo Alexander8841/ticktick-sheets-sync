@@ -75,6 +75,7 @@ def test_config_loader():
     assert "Лиза" in cfg.known_students
     assert cfg.default_durations.get("Лиза") == 1.5
     assert cfg.default_durations.get("Лиза 2") == 1.0
+    assert cfg.log_path and "sync.log" in cfg.log_path, f"Unexpected log path: {cfg.log_path}"
 
     # Test loading config.example.yaml
     example_path = REPO_ROOT / "config" / "config.example.yaml"
@@ -437,6 +438,88 @@ def test_deduplication_safeguard():
             pass
 
 
+def test_logging_system():
+    print("[16] Testing file logging system and log output...")
+    test_log = REPO_ROOT / "logs" / "_test_temp.log"
+    try:
+        logger, path = sync_module.setup_logging(test_log)
+        logger.info("TEST_LOG_ENTRY_12345")
+        assert path.exists(), f"Log file was not created: {path}"
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+        assert "TEST_LOG_ENTRY_12345" in content
+        assert "[INFO]" in content
+        main_log = REPO_ROOT / "logs" / "sync.log"
+        assert main_log.exists(), f"Main sync.log not found: {main_log}"
+        with open(main_log, "r", encoding="utf-8") as f:
+            main_content = f.read()
+        assert "TickTick" in main_content
+        print("    [PASS] File logging initializes cleanly and records UTF-8 data")
+    finally:
+        try:
+            for h in list(sync_module.LOGGER.handlers):
+                if getattr(h, "baseFilename", None) == str(test_log.resolve()):
+                    h.close()
+                    sync_module.LOGGER.removeHandler(h)
+            if test_log.exists():
+                test_log.unlink()
+        except Exception:
+            pass
+
+
+def test_log_formula_self_healing():
+    print("[17] Testing Log worksheet formula self-healing & collision clearance...")
+    sh = get_shared_spreadsheet()
+    temp_title = "_test_heal_temp"
+
+    for ws in sync_module.call_with_retry(lambda: sh.worksheets()):
+        if ws.title == temp_title:
+            try:
+                sync_module.call_with_retry(lambda: sh.del_worksheet(ws))
+            except Exception:
+                pass
+            break
+
+    ws_test = sync_module.call_with_retry(lambda: sh.add_worksheet(title=temp_title, rows=5, cols=8))
+    try:
+        # Corrupted header and stray space in column F
+        corrupted_data = [
+            ["Дата и время", "Ученик", "Длительность (ч)", "BROKEN_RATE", "BROKEN_SUM", "#REF!", "BROKEN_ST", "Task ID"],
+            [sync_module.datetime_to_serial(datetime(2026, 9, 1, 10, 0)), "Лиза", 1.5, "", "", "  ", "", "tid_heal_001"],
+        ]
+        sync_module.call_with_retry(lambda: ws_test.update(range_name="A1:H2", values=corrupted_data))
+
+        repaired, cleared = sync_module.ensure_log_integrity(ws_test, sh, ws_test.id, 2)
+        assert len(repaired) == 4, f"Expected 4 repaired headers, got {repaired}"
+        assert "F2" in cleared, f"Expected F2 to be cleared, got {cleared}"
+
+        hdr_forms = sync_module.call_with_retry(lambda: ws_test.get("D1:G1", value_render_option="FORMULA"))
+        assert all(str(f[0]).startswith("={") for f in hdr_forms if f)
+
+        f2_val = sync_module.call_with_retry(lambda: ws_test.acell("F2", value_render_option="FORMULA")).value
+        assert f2_val in ("", None), f"F2 still has value: {f2_val}"
+
+        print("    [PASS] Log formula self-healing clears collisions and restores canonical formulas")
+    finally:
+        try:
+            sync_module.call_with_retry(lambda: sh.del_worksheet(ws_test))
+        except Exception:
+            pass
+
+
+def test_sheet_ordering_independence():
+    print("[18] Testing sheet ordering independence (Dashboard at index 0)...")
+    sh = get_shared_spreadsheet()
+    worksheets = sync_module.call_with_retry(lambda: sh.worksheets())
+    assert worksheets[0].title == CONFIG.dashboard_worksheet, (
+        f"Expected first worksheet to be '{CONFIG.dashboard_worksheet}', got '{worksheets[0].title}'"
+    )
+    ws_dash = sync_module.call_with_retry(lambda: sh.worksheet(CONFIG.dashboard_worksheet))
+    ws_log = sync_module.call_with_retry(lambda: sh.worksheet(CONFIG.log_worksheet))
+    assert ws_dash.id != ws_log.id
+    print("    [PASS] Spreadsheet correctly ordered with Dashboard first and named sheet lookups intact")
+
+
 if __name__ == "__main__":
     test_sqlite()
     test_config_loader()
@@ -453,6 +536,9 @@ if __name__ == "__main__":
     test_reconciliation_logic_unit()
     test_reconciliation_isolated_sheet()
     test_deduplication_safeguard()
+    test_logging_system()
+    test_log_formula_self_healing()
+    test_sheet_ordering_independence()
     print("\n" + "=" * 50)
-    print("🎉 ALL 15 TEST SUITES PASSED FLAWLESSLY!")
+    print("🎉 ALL 18 TEST SUITES PASSED FLAWLESSLY!")
     print("=" * 50)

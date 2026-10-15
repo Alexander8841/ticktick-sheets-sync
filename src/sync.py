@@ -12,10 +12,60 @@ import sqlite3
 import sys
 import time
 from datetime import datetime, timedelta
+import logging
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar, Union
 
 T = TypeVar("T")
+
+LOGGER = logging.getLogger("ticktick_sync")
+_logging_configured = False
+
+
+def setup_logging(
+    log_path: Optional[Union[str, Path]] = None,
+    level: int = logging.INFO
+) -> Tuple[logging.Logger, Path]:
+    """
+    Sets up file logging for the sync engine with UTF-8 encoding and rotation.
+    Avoids duplicate handlers across repeated invocations.
+    """
+    global _logging_configured, LOGGER
+    if log_path is None:
+        repo_root = Path(__file__).resolve().parent.parent
+        target_path = repo_root / "logs" / "sync.log"
+    else:
+        target_path = Path(log_path).resolve()
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    LOGGER.setLevel(level)
+
+    # Check if a FileHandler targeting target_path already exists
+    has_file_handler = False
+    for h in LOGGER.handlers:
+        if isinstance(h, (logging.FileHandler, RotatingFileHandler)):
+            if Path(getattr(h, "baseFilename", "")).resolve() == target_path:
+                has_file_handler = True
+                break
+
+    if not has_file_handler:
+        file_handler = RotatingFileHandler(
+            str(target_path),
+            maxBytes=10 * 1024 * 1024,  # 10 MB
+            backupCount=5,
+            encoding="utf-8"
+        )
+        formatter = logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S"
+        )
+        file_handler.setFormatter(formatter)
+        file_handler.setLevel(level)
+        LOGGER.addHandler(file_handler)
+
+    _logging_configured = True
+    return LOGGER, target_path
 
 
 def is_quota_or_rate_limit_error(e: Exception) -> bool:
@@ -41,10 +91,12 @@ def call_with_retry(
         except Exception as e:
             if is_quota_or_rate_limit_error(e) and attempt < max_retries - 1:
                 delay = base_delay * (backoff_factor ** attempt)
-                print(
+                msg = (
                     f"⏳ Превышен лимит запросов Google Sheets API (429/Quota). Ожидание {delay:.1f}с "
                     f"(попытка {attempt + 1}/{max_retries})..."
                 )
+                print(msg)
+                LOGGER.warning(msg)
                 time.sleep(delay)
             else:
                 raise
@@ -328,6 +380,10 @@ def get_ticktick_tasks(
     rows = cur.fetchall()
     conn.close()
 
+    LOGGER.info(
+        f"TickTick SQLite: найдено {len(rows)} завершенных задач в проекте {project_id} (>= {academic_year_start})"
+    )
+
     tasks = []
     for r in rows:
         task_id, raw_title, start_str, due_str, comp_str = r
@@ -368,7 +424,88 @@ def get_ticktick_tasks(
             }
         )
 
+    LOGGER.info(
+        f"TickTick SQLite: отобрано {len(tasks)} задач к синхронизации (отфильтровано: {len(rows) - len(tasks)})"
+    )
+
     return tasks
+
+
+LOG_CANONICAL_FORMULAS = {
+    "D1": '={"Ставка (₽/ч)"; MAP(A2:A; G2:G; LAMBDA(a; g; IF(a=""; ""; IF(g=""; ""; IFERROR(VLOOKUP(g; \'Справочник\'!$A$2:$D; 3; FALSE); 0)))))}',
+    "E1": '={"Сумма (₽)"; MAP(A2:A; C2:C; D2:D; LAMBDA(a; c; d; IF(a=""; ""; IFERROR(ROUND(c * d; 2); 0))))}',
+    "F1": '={"Дата (норм.)"; MAP(A2:A; LAMBDA(a; IF(a=""; ""; IF(ISNUMBER(a); INT(a); IFERROR(INT(DATEVALUE(a)); IFERROR(DATE(VALUE(REGEXEXTRACT(TO_TEXT(a); "(20\\d\\d)")); MATCH(LOWER(REGEXEXTRACT(TO_TEXT(a); "^[A-Za-z]+")); {"january";"february";"march";"april";"may";"june";"july";"august";"september";"october";"november";"december"}; 0); VALUE(REGEXEXTRACT(TO_TEXT(a); "[A-Za-z]+\\s+(\\d{1,2})"))); ""))))))}',
+    "G1": '={"Ученик (норм.)"; LET(\n  raw_names; FILTER(\'Справочник\'!$A$2:$A; \'Справочник\'!$A$2:$A<>""; NOT(REGEXMATCH(\'Справочник\'!$A$2:$A; "(?i)ИТОГО")));\n  sorted_names; SORT(raw_names; LEN(raw_names); FALSE);\n  MAP(B2:B; LAMBDA(b;\n    IF(b=""; "";\n      LET(\n        matched; REDUCE(""; sorted_names; LAMBDA(acc; name;\n          IF(acc<>""; acc; IF(ISNUMBER(SEARCH(name; b)); name; ""))\n        ));\n        IF(matched<>""; matched; TRIM(b))\n      )\n    )\n  ))\n)}',
+}
+
+
+def ensure_log_integrity(
+    ws_log: gspread.Worksheet,
+    sh: gspread.Spreadsheet,
+    sheet_id: int,
+    total_rows: int
+) -> Tuple[List[str], List[str]]:
+    """
+    Ensures the integrity of array formulas in 'Лог' columns D, E, F, G:
+    1. Detects and clears any user-entered stray cells/spaces in D2:G that cause
+       array formula spill collisions (#REF! errors).
+    2. Verifies and restores header formulas D1, E1, F1, G1 if missing, corrupt,
+       or showing #REF!.
+    Returns (repaired_headers, cleared_cells).
+    """
+    repaired_headers: List[str] = []
+    cleared_cells: List[str] = []
+
+    # 1. Check for stray hardcoded entries in D2:G
+    grid = call_with_retry(
+        lambda: ws_log.get(f"D2:G{max(total_rows, 2)}", value_render_option="FORMULA")
+    )
+    col_names = ["D", "E", "F", "G"]
+    stray_ranges = []
+    for r_idx, row in enumerate(grid, start=2):
+        for c_idx, val in enumerate(row):
+            if c_idx < len(col_names) and val is not None and val != "":
+                stray_ranges.append(f"{col_names[c_idx]}{r_idx}")
+
+    if stray_ranges:
+        call_with_retry(lambda: ws_log.batch_clear(stray_ranges))
+        cleared_cells = stray_ranges
+        LOGGER.warning(f"Очищены блокирующие ячейки в столбцах формул листа 'Лог': {stray_ranges}")
+
+    # 2. Check header cells D1..G1 formulas and formatted values
+    header_formulas = call_with_retry(
+        lambda: ws_log.get("D1:G1", value_render_option="FORMULA")
+    )
+    current_formulas = header_formulas[0] if header_formulas else []
+
+    header_formatted = call_with_retry(
+        lambda: ws_log.get("D1:G1", value_render_option="FORMATTED_VALUE")
+    )
+    current_formatted = header_formatted[0] if header_formatted else []
+
+    updates = []
+    for idx, col in enumerate(col_names):
+        cell_ref = f"{col}1"
+        form_val = current_formulas[idx] if idx < len(current_formulas) else ""
+        fmt_val = (current_formatted[idx] if idx < len(current_formatted) else "").strip()
+
+        canonical = LOG_CANONICAL_FORMULAS[cell_ref]
+        needs_repair = False
+
+        if not form_val or not str(form_val).startswith("={"):
+            needs_repair = True
+        elif fmt_val.startswith("#") and fmt_val.endswith("!"):
+            needs_repair = True
+
+        if needs_repair:
+            updates.append({"range": cell_ref, "values": [[canonical]]})
+            repaired_headers.append(cell_ref)
+
+    if updates:
+        call_with_retry(lambda: ws_log.batch_update(updates, value_input_option="USER_ENTERED"))
+        LOGGER.info(f"Восстановлены формулы в заголовках листа 'Лог': {repaired_headers}")
+
+    return repaired_headers, cleared_cells
 
 
 def sync_google_sheets(
@@ -423,6 +560,15 @@ def sync_google_sheets(
     all_values = call_with_retry(lambda: ws_log.get_all_values())
     if not all_values:
         raise ValueError(f"Лист '{worksheet_name}' пуст!")
+
+    repaired_formulas = []
+    cleared_stray_cells = []
+    if worksheet_name == cfg.log_worksheet:
+        repaired_formulas, cleared_stray_cells = ensure_log_integrity(
+            ws_log, sh, sheet_id, len(all_values)
+        )
+        if repaired_formulas or cleared_stray_cells:
+            all_values = call_with_retry(lambda: ws_log.get_all_values())
 
     header = all_values[0]
     header_updates = []
@@ -577,6 +723,9 @@ def sync_google_sheets(
             )
             new_date_str = t["datetime"].strftime("%d.%m.%Y %H:%M")
             print(f"[ПЕРЕНОС] Обновлено занятие: {t['student']}, новая дата: {new_date_str}")
+            LOGGER.info(
+                f"[ПЕРЕНОС] Обновлено занятие: {t['student']}, новая дата: {new_date_str} ({t['duration']} ч) | ID: {t['id']}"
+            )
         call_with_retry(lambda: ws_log.batch_update(update_data, value_input_option="USER_ENTERED"))
 
     # 2. Apply deletions in descending order of row index
@@ -599,6 +748,7 @@ def sync_google_sheets(
         current_grid_rows -= len(to_delete)
         for item in to_delete:
             print(f"[ОТМЕНА] Удалено занятие: {item['student']} за {item['date']}")
+            LOGGER.info(f"[ОТМЕНА] Удалено занятие: {item['student']} за {item['date']} | ID: {item['id']}")
 
     # 3. Append new tasks
     rows_after_deletions = len(all_values) - len(to_delete)
@@ -636,11 +786,17 @@ def sync_google_sheets(
         call_with_retry(lambda: ws_log.update(range_name=f"A{start_row}:C{end_row}", values=rows_abc))
         call_with_retry(lambda: ws_log.update(range_name=f"H{start_row}:H{end_row}", values=rows_h))
         added_count = len(new_tasks)
+        for t in new_tasks:
+            dt_str = t["datetime"].strftime("%d.%m.%Y %H:%M")
+            LOGGER.info(f"[ДОБАВЛЕНО] Новое занятие: {t['student']} за {dt_str} ({t['duration']} ч) | ID: {t['id']}")
+
+    if not to_delete and not to_update and not new_tasks:
+        LOGGER.info("✨ Все занятия уже были синхронизированы ранее (новых уроков: 0).")
 
     final_total_rows = rows_after_deletions + len(new_tasks)
 
     # 4. Format & Sort if any changes were made
-    if to_update or to_delete or new_tasks:
+    if to_update or to_delete or new_tasks or (worksheet_name == cfg.log_worksheet and (repaired_formulas or cleared_stray_cells)):
         batch_requests = []
 
         if final_total_rows > 1:
@@ -690,6 +846,94 @@ def sync_google_sheets(
                                 }
                             },
                             "fields": "userEnteredFormat(numberFormat,horizontalAlignment,verticalAlignment)",
+                        }
+                    },
+                    # Col D: rate format
+                    {
+                        "repeatCell": {
+                            "range": {
+                                "sheetId": sheet_id,
+                                "startRowIndex": 1,
+                                "endRowIndex": final_total_rows,
+                                "startColumnIndex": 3,
+                                "endColumnIndex": 4,
+                            },
+                            "cell": {
+                                "userEnteredFormat": {
+                                    "numberFormat": {
+                                        "type": "NUMBER",
+                                        "pattern": '# ##0 "₽"',
+                                    },
+                                    "horizontalAlignment": "CENTER",
+                                    "verticalAlignment": "MIDDLE",
+                                }
+                            },
+                            "fields": "userEnteredFormat(numberFormat,horizontalAlignment,verticalAlignment)",
+                        }
+                    },
+                    # Col E: sum format
+                    {
+                        "repeatCell": {
+                            "range": {
+                                "sheetId": sheet_id,
+                                "startRowIndex": 1,
+                                "endRowIndex": final_total_rows,
+                                "startColumnIndex": 4,
+                                "endColumnIndex": 5,
+                            },
+                            "cell": {
+                                "userEnteredFormat": {
+                                    "numberFormat": {
+                                        "type": "NUMBER",
+                                        "pattern": '# ##0 "₽"',
+                                    },
+                                    "horizontalAlignment": "CENTER",
+                                    "verticalAlignment": "MIDDLE",
+                                }
+                            },
+                            "fields": "userEnteredFormat(numberFormat,horizontalAlignment,verticalAlignment)",
+                        }
+                    },
+                    # Col F: normalized date format
+                    {
+                        "repeatCell": {
+                            "range": {
+                                "sheetId": sheet_id,
+                                "startRowIndex": 1,
+                                "endRowIndex": final_total_rows,
+                                "startColumnIndex": 5,
+                                "endColumnIndex": 6,
+                            },
+                            "cell": {
+                                "userEnteredFormat": {
+                                    "numberFormat": {
+                                        "type": "DATE",
+                                        "pattern": "dd.mm.yyyy",
+                                    },
+                                    "horizontalAlignment": "CENTER",
+                                    "verticalAlignment": "MIDDLE",
+                                }
+                            },
+                            "fields": "userEnteredFormat(numberFormat,horizontalAlignment,verticalAlignment)",
+                        }
+                    },
+                    # Col G: normalized student
+                    {
+                        "repeatCell": {
+                            "range": {
+                                "sheetId": sheet_id,
+                                "startRowIndex": 1,
+                                "endRowIndex": final_total_rows,
+                                "startColumnIndex": 6,
+                                "endColumnIndex": 7,
+                            },
+                            "cell": {
+                                "userEnteredFormat": {
+                                    "horizontalAlignment": "CENTER",
+                                    "verticalAlignment": "MIDDLE",
+                                }
+                            },
+                            "fields": "userEnteredFormat(horizontalAlignment,verticalAlignment)",
                         }
                     },
                     # Col H: centered task ID
@@ -808,7 +1052,7 @@ def get_current_stats(
                     col_str = col_to_letter(c_idx + 1)
                     errors.append(f"Лист '{s.title}', ячейка {col_str}{r_idx+1}: {v_str}")
 
-    return {
+    res_stats = {
         "year": year_val,
         "month": (
             month_name_map.get(int(month_val), str(month_val))
@@ -824,8 +1068,29 @@ def get_current_stats(
         "errors": errors,
     }
 
+    LOGGER.info(
+        f"📊 Итоги за месяц ({res_stats['month']} {year_val}): Выручка = {rev_val} ({plan_val}, {diff_val}), "
+        f"Отработано часов = {hours_val}, Проведено уроков = {lessons_val}"
+    )
+    if student_stats:
+        for s in student_stats:
+            LOGGER.info(f"   - {s['name']}: {s['lessons']} ур. | {s['hours']} ч | {s['revenue']}")
+    if errors:
+        LOGGER.warning(f"⚠️ Обнаружены ошибки формул на листах ({len(errors)}): {errors[:5]}")
+    else:
+        LOGGER.info("✅ Проверка формул: 0 ошибок (#REF!, #VALUE!) на всех листах.")
 
-def print_report(added_count: int, new_tasks: list, stats: dict, cancelled: Optional[list] = None, updated: Optional[list] = None):
+    return res_stats
+
+
+def print_report(
+    added_count: int,
+    new_tasks: list,
+    stats: dict,
+    cancelled: Optional[list] = None,
+    updated: Optional[list] = None,
+    log_path: Optional[Union[str, Path]] = None,
+):
     """Outputs a clean, readable console report for Google Sheets synchronization."""
     cancelled = cancelled or []
     updated = updated or []
@@ -881,6 +1146,9 @@ def print_report(added_count: int, new_tasks: list, stats: dict, cancelled: Opti
         print(f"   ⚠️  Обнаружены ошибки формул ({len(stats['errors'])}):")
         for err in stats["errors"][:5]:
             print(f"      • {err}")
+
+    if log_path:
+        print(f"\n 📄 Подробный журнал работы: {log_path}")
     print("═" * 68 + "\n")
 
 
@@ -890,8 +1158,18 @@ def main():
     parser.add_argument("--no-pause", action="store_true", help="Do not prompt for pause on exit")
     args = parser.parse_args()
 
+    start_time = time.time()
+    log_file = None
+
     try:
         cfg = load_config(args.config)
+        _, log_file = setup_logging(cfg.log_path)
+
+        LOGGER.info("=" * 68)
+        LOGGER.info("🚀 Запуск синхронизации TickTick -> Google Sheets")
+        LOGGER.info(f"   Файл конфигурации: {cfg.config_file_path}")
+        LOGGER.info(f"   Таблица Google Sheets ID: {cfg.spreadsheet_id}")
+        LOGGER.info(f"   База данных TickTick: {cfg.ticktick_db_path}")
 
         # 1. Load Google Sheets client
         gc = get_google_sheets_client(cfg.credentials_path)
@@ -912,9 +1190,21 @@ def main():
         stats = get_current_stats(res.sh, config=cfg)
 
         # 5. Output console report
-        print_report(res.added_count, res.new_tasks, stats, cancelled=res.cancelled, updated=res.updated)
+        print_report(
+            res.added_count,
+            res.new_tasks,
+            stats,
+            cancelled=res.cancelled,
+            updated=res.updated,
+            log_path=log_file,
+        )
+
+        elapsed = time.time() - start_time
+        LOGGER.info(f"🏁 Синхронизация успешно завершена за {elapsed:.2f} сек.")
+        LOGGER.info("=" * 68)
 
     except Exception as e:
+        LOGGER.exception(f"❌ Критическая ошибка при синхронизации: {e}")
         print(f"\n❌ Критическая ошибка при синхронизации: {e}", file=sys.stderr)
         import traceback
         traceback.print_exc()
